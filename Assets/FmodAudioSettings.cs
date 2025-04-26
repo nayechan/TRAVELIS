@@ -51,7 +51,7 @@ public class FMODAudioSettings : MonoBehaviour
 
     private void Start()
     {
-        // Delay driver population to ensure FMOD is properly initialized
+        // Wait for FMOD to be fully initialized by other systems
         Invoke("PopulateASIODrivers", 1.0f);
     }
 
@@ -59,16 +59,22 @@ public class FMODAudioSettings : MonoBehaviour
     {
         AvailableASIODrivers.Clear();
         
-        if (RuntimeManager.CoreSystem.hasHandle())
+        if (!RuntimeManager.CoreSystem.hasHandle())
+        {
+            Debug.LogWarning("FMOD system not initialized when attempting to populate ASIO drivers");
+            return;
+        }
+        
+        try
         {
             // Store current output mode
             OUTPUTTYPE originalOutput;
             RuntimeManager.CoreSystem.getOutput(out originalOutput);
 
-            // Temporarily set output to ASIO to properly enumerate ASIO devices
+            // We need to be careful NOT to call close() here, just change the output type
             RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.ASIO);
             
-            // Now get the number of drivers (should include ASIO devices)
+            // Now get the number of drivers
             int numDrivers = 0;
             RuntimeManager.CoreSystem.getNumDrivers(out numDrivers);
             
@@ -87,86 +93,124 @@ public class FMODAudioSettings : MonoBehaviour
                     i, out name, 256, out guid, out systemRate, out speakerMode, out speakerModeChannels);
                 
                 Debug.Log($"ASIO Driver {i}: '{name}' - System Rate: {systemRate}");
-                
-                // In ASIO mode, all drivers should be ASIO-compatible
                 AvailableASIODrivers.Add(name);
             }
             
-            // Restore original output mode
+            // Restore original output mode without closing the system
             RuntimeManager.CoreSystem.setOutput(originalOutput);
 
             Debug.Log($"ASIO drivers found: {AvailableASIODrivers.Count}");
         }
-        else
+        catch (System.Exception e)
         {
-            Debug.LogWarning("FMOD system not initialized when attempting to populate ASIO drivers");
+            Debug.LogError($"Error populating ASIO drivers: {e.Message}");
         }
     }
 
-    // Apply the audio output settings - call this before FMOD fully initializes
+    // IMPORTANT: This should ONLY be called at application startup BEFORE FMOD is initialized
+    // Do not call this after FMOD is initialized or during runtime
     public void ApplyOutputSettings()
     {
-        if (!RuntimeManager.CoreSystem.hasHandle())
+        FMOD.System coreSystem = RuntimeManager.CoreSystem;
+        
+        if (!coreSystem.hasHandle())
+        {
+            Debug.LogError("Cannot apply FMOD settings to an invalid system");
             return;
+        }
 
         try
         {
-            // First properly close the system
-            RuntimeManager.CoreSystem.close();
-
             // Set the output type based on user preference
             switch (CurrentOutputMode)
             {
                 case AudioOutputMode.WASAPI:
-                    RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.WASAPI);
+                    coreSystem.setOutput(OUTPUTTYPE.WASAPI);
                     break;
                     
                 case AudioOutputMode.ASIO:
-                    RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.ASIO);
+                    coreSystem.setOutput(OUTPUTTYPE.ASIO);
                     // Set the specific ASIO driver if we have one selected
                     if (CurrentASIODriverIndex < AvailableASIODrivers.Count && CurrentASIODriverIndex >= 0)
                     {
-                        RuntimeManager.CoreSystem.setDriver(CurrentASIODriverIndex);
+                        coreSystem.setDriver(CurrentASIODriverIndex);
                     }
                     break;
                     
                 default:
-                    RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.AUTODETECT);
+                    coreSystem.setOutput(OUTPUTTYPE.AUTODETECT);
                     break;
             }
-
-            // Reinitialize with the new settings
-            RESULT result = RuntimeManager.CoreSystem.init(
-                512, INITFLAGS.NORMAL, System.IntPtr.Zero);
-                
-            if (result != RESULT.OK)
-            {
-                // Failed to initialize with these settings, revert to defaults
-                Debug.LogError($"Failed to initialize FMOD with selected output mode. Error: {result}");
-                CurrentOutputMode = AudioOutputMode.Default;
-                RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.AUTODETECT);
-                RuntimeManager.CoreSystem.init(512, INITFLAGS.NORMAL, System.IntPtr.Zero);
-            }
-            else
-            {
-                Debug.Log($"Successfully initialized FMOD with output mode: {CurrentOutputMode}");
-            }
+            
+            Debug.Log($"Applied audio output settings: {CurrentOutputMode}");
         }
         catch (System.Exception e)
         {
             Debug.LogError($"Error applying audio settings: {e.Message}");
+        }
+    }
+
+    // Create a method to safely change the output during runtime (if needed)
+    public bool ChangeOutputDuringRuntime(FMOD.System coreSystem)
+    {
+        if (!coreSystem.hasHandle())
+        {
+            Debug.LogError("Cannot change output of an invalid FMOD system");
+            return false;
+        }
+
+        try
+        {
+            // Get current output type
+            OUTPUTTYPE currentOutput;
+            coreSystem.getOutput(out currentOutput);
             
-            // Try to recover
-            try
+            // Set new output type
+            OUTPUTTYPE newOutput = OUTPUTTYPE.AUTODETECT;
+            switch (CurrentOutputMode)
             {
-                CurrentOutputMode = AudioOutputMode.Default;
-                RuntimeManager.CoreSystem.setOutput(OUTPUTTYPE.AUTODETECT);
-                RuntimeManager.CoreSystem.init(512, INITFLAGS.NORMAL, System.IntPtr.Zero);
+                case AudioOutputMode.WASAPI:
+                    newOutput = OUTPUTTYPE.WASAPI;
+                    break;
+                case AudioOutputMode.ASIO:
+                    newOutput = OUTPUTTYPE.ASIO;
+                    break;
+                default:
+                    newOutput = OUTPUTTYPE.AUTODETECT;
+                    break;
             }
-            catch
+            
+            // Only change if different
+            if (currentOutput != newOutput)
             {
-                Debug.LogError("Failed to recover FMOD system after error");
+                RESULT result = coreSystem.setOutput(newOutput);
+                if (result != RESULT.OK)
+                {
+                    Debug.LogError($"Failed to change output type: {result}");
+                    return false;
+                }
+                
+                // If ASIO, set the driver
+                if (newOutput == OUTPUTTYPE.ASIO && 
+                    CurrentASIODriverIndex >= 0 && 
+                    CurrentASIODriverIndex < AvailableASIODrivers.Count)
+                {
+                    result = coreSystem.setDriver(CurrentASIODriverIndex);
+                    if (result != RESULT.OK)
+                    {
+                        Debug.LogError($"Failed to set ASIO driver: {result}");
+                        return false;
+                    }
+                }
             }
+            
+            Debug.Log($"Successfully changed output to {CurrentOutputMode}");
+            return true;
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"Error changing output: {e.Message}");
+            return false;
         }
     }
 
